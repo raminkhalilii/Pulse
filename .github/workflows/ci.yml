@@ -66,11 +66,15 @@ jobs:
       - name: Run unit tests
         run: npm test
 
-  # ── 3. Build ──────────────────────────────────────────────────────────────
+  # ── 3. Build & Push Images ─────────────────────────────────────────────────
   build:
-    name: Build (Docker)
+    name: Build & Push (Docker)
     needs: test
     runs-on: ubuntu-latest
+    # Only push images on merges to main, not on PRs (no secrets available on forks)
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +83,58 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      # Verify all three application images compile successfully.
-      # Secrets are not needed at build time — only at runtime.
-      - name: Build Docker images
-        run: docker compose build --parallel
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and push on main) — backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend-pulse
+          file: ./backend-pulse/Dockerfile
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/${{ github.repository }}/backend:${{ github.sha }},ghcr.io/${{ github.repository }}/backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build (and push on main) — frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend-pulse
+          file: ./frontend-pulse/Dockerfile
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/${{ github.repository }}/frontend:${{ github.sha }},ghcr.io/${{ github.repository }}/frontend:latest
+          build-args: |
+            BACKEND_URL=http://backend:3000
+            NEXT_PUBLIC_API_URL=https://${{ secrets.DOMAIN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── 4. Deploy ──────────────────────────────────────────────────────────────
+  # Only runs on push to main AND only if build succeeded.
+  # Uses SSH to connect to the VPS and execute the deploy script.
+  #
+  # Required GitHub Secrets:
+  #   VPS_HOST        — IP address or hostname of the VPS
+  #   VPS_USER        — SSH user (e.g. "deploy" or "ubuntu")
+  #   VPS_SSH_KEY     — PEM-encoded private key for SSH access
+  #   DOMAIN          — Your domain (e.g. "pulse.example.com")
+  deploy:
+    name: Deploy to VPS
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            bash /opt/pulse/scripts/deploy.sh ${{ github.sha }}
